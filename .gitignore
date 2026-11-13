@@ -1,0 +1,20 @@
+# Game data and anything extracted from it stays local - never commit it.
+data/
+*.bin
+*.cue
+*.iso
+*.img
+*.db
+*.sqlite
+*.json
+!package.json
+
+# local outputs except the shareable summary
+reports/*
+!reports/summary.md
+!reports/.gitkeep
+
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
