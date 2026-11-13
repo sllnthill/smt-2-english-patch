@@ -10,7 +10,8 @@ SELECT source_file,
        COUNT(*)                         AS lines,
        SUM(byte_length)                 AS bytes,
        ROUND(AVG(char_count), 1)        AS avg_chars,
-       SUM(duplicate_of IS NOT NULL)    AS duplicates
+       SUM(duplicate_of IS NOT NULL AND is_pointer_reuse = 0) AS duplicates,
+       SUM(is_pointer_reuse)            AS reused_pointers
 FROM lines
 GROUP BY source_file
 ORDER BY bytes DESC;
@@ -44,13 +45,14 @@ WHERE unknown_byte_count > 0
 GROUP BY source_file;
 
 -- 6. Data quality: empty strings and bad pointers
+--    (bad pointers are stored as empty rows, so count them separately)
 SELECT source_file,
-       SUM(is_empty)       AS empty_lines,
-       SUM(is_bad_pointer) AS bad_pointers
+       SUM(is_empty = 1 AND is_bad_pointer = 0) AS empty_lines,
+       SUM(is_bad_pointer)                      AS bad_pointers
 FROM lines
 GROUP BY source_file;
 
--- 7. Most repeated lines (same text stored more than once)
+-- 7. Most repeated lines (same text, whether stored again or reused by pointer)
 SELECT l.duplicate_of AS first_line_id, COUNT(*) + 1 AS copies,
        substr(f.text_clean, 1, 40) AS preview
 FROM lines l JOIN lines f ON f.line_id = l.duplicate_of

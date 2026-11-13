@@ -76,6 +76,23 @@ def open_out(path: Optional[str]):
     return open(path, "w", encoding="utf-8", newline="")
 
 
+def sjis_char(data: bytes, i: int, stop: int) -> Tuple[Optional[str], int]:
+    """Decode one Shift-JIS character at data[i]. Returns (char, width in
+    bytes), or (None, 0) if the bytes there are not a Shift-JIS character.
+    Uses cp932, the superset real games were written against."""
+    b = data[i]
+    if 0x20 <= b < 0x7F or 0xA1 <= b <= 0xDF:      # ASCII, halfwidth katakana
+        return data[i:i + 1].decode("cp932"), 1
+    if (0x81 <= b <= 0x9F or 0xE0 <= b <= 0xFC) and i + 1 < stop:
+        t = data[i + 1]
+        if 0x40 <= t <= 0xFC and t != 0x7F:
+            try:
+                return data[i:i + 2].decode("cp932"), 2
+            except UnicodeDecodeError:
+                pass
+    return None, 0
+
+
 # --------------------------------------------------------------------------- #
 # table files
 # --------------------------------------------------------------------------- #
@@ -86,6 +103,7 @@ class Table:
     end_codes: Dict[bytes, str] = field(default_factory=dict)
     newline_codes: Dict[bytes, str] = field(default_factory=dict)
     max_len: int = 1
+    sjis: bool = False      # fall back to Shift-JIS for bytes the table lacks
 
     @classmethod
     def load(cls, path: str) -> "Table":
@@ -143,21 +161,6 @@ class Table:
             t.end_codes[b"\x00"] = "<END>"
         return t
 
-    sjis: bool = False
-
-    def _sjis_char(self, data: bytes, i: int, stop: int) -> Tuple[Optional[str], int]:
-        b = data[i]
-        if 0x20 <= b < 0x7F or 0xA1 <= b <= 0xDF:
-            return data[i:i + 1].decode("shift_jis", "replace"), 1
-        if (0x81 <= b <= 0x9F or 0xE0 <= b <= 0xFC) and i + 1 < stop:
-            t = data[i + 1]
-            if 0x40 <= t <= 0xFC and t != 0x7F:
-                try:
-                    return data[i:i + 2].decode("cp932"), 2
-                except UnicodeDecodeError:
-                    pass
-        return None, 0
-
     def decode(self, data: bytes, start: int, stop: int,
                stop_at_end: bool = True) -> Tuple[str, int]:
         """Decode data[start:stop]. Returns (text, offset after last byte used).
@@ -187,7 +190,7 @@ class Table:
                     matched = True
                     break
             if not matched and self.sjis:
-                ch, w = self._sjis_char(data, i, stop)
+                ch, w = sjis_char(data, i, stop)
                 if ch is not None:
                     out.append(ch)
                     i += w
@@ -278,6 +281,9 @@ class Disc:
                      "Use the .bin (not the .cue), and only the data track.")
         self.sectors = self.size // self.sector_size
 
+    def close(self) -> None:
+        self.f.close()
+
     def raw_sector(self, lba: int) -> bytes:
         self.f.seek(lba * self.sector_size)
         return self.f.read(self.sector_size)
@@ -326,6 +332,11 @@ class Disc:
                 continue
             r = data[pos:pos + ln]
             pos += ln
+            # a directory record is 33 bytes plus its name; anything shorter
+            # (or cut off by the end of the directory) is a damaged image
+            if len(r) < 34 or len(r) < 33 + r[32]:
+                sys.exit(f"damaged directory record in '{path or '/'}' "
+                         f"(sector {lba}); is this a clean disc image?")
             nlen = r[32]
             name = r[33:33 + nlen]
             if name in (b"\x00", b"\x01"):
@@ -342,8 +353,23 @@ class Disc:
                 out.append(dict(path=full, lba=flba, size=fsize, form2=form2))
 
 
+def safe_disc_path(path: str) -> bool:
+    """True if a path read from a disc image is safe to create under the
+    output folder: no empty, '.' or '..' parts, no drive or backslash tricks."""
+    parts = path.split("/")
+    return all(p not in ("", ".", "..") and "\\" not in p and ":" not in p
+               for p in parts)
+
+
 def cmd_disc(a) -> None:
     d = Disc(a.image)
+    try:
+        _disc_action(d, a)
+    finally:
+        d.close()
+
+
+def _disc_action(d: Disc, a) -> None:
     files = d.files()
     if a.action == "list":
         kind = "raw 2352-byte sectors" if d.raw else "2048-byte sectors (.iso)"
@@ -360,6 +386,10 @@ def cmd_disc(a) -> None:
     for f in files:
         if want and f["path"].upper() not in want and \
                 f["path"].split("/")[-1].upper() not in want:
+            continue
+        # names come from the image, so never let one escape the output folder
+        if not safe_disc_path(f["path"]):
+            print(f"  skipped (unsafe name): {f['path']!r}", file=sys.stderr)
             continue
         dest = os.path.join(a.out, *f["path"].split("/"))
         os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
@@ -465,25 +495,16 @@ def cmd_strings(a) -> None:
     else:  # shift-jis
         i = start
         while i < end:
-            j, chars = i, []
+            j, chars, has_wide = i, [], False
             while j < end:
-                b = rom[j]
-                if 0x20 <= b < 0x7F or 0xA1 <= b <= 0xDF:
-                    ch = rom[j:j + 1]
-                    w = 1
-                elif (0x81 <= b <= 0x9F or 0xE0 <= b <= 0xEF) and j + 1 < end \
-                        and 0x40 <= rom[j + 1] <= 0xFC and rom[j + 1] != 0x7F:
-                    ch = rom[j:j + 2]
-                    w = 2
-                else:
+                ch, w = sjis_char(rom, j, end)
+                if ch is None:
                     break
-                try:
-                    chars.append(ch.decode("shift_jis"))
-                except UnicodeDecodeError:
-                    break
+                chars.append(ch)
+                has_wide = has_wide or w == 2
                 j += w
             # require at least one double-byte char so we skip random ASCII noise
-            if len(chars) >= a.min and any(len(c.encode("shift_jis")) == 2 for c in chars):
+            if len(chars) >= a.min and has_wide:
                 records.append(dict(index=len(records), offset=i, pointer_at=None,
                                     pointer=None, length=j - i, text="".join(chars)))
                 i = j
@@ -685,12 +706,11 @@ def cmd_findptr(a) -> None:
 
 
 def cmd_ptrscan(a) -> None:
-    """Find runs of 32-bit PS1 RAM pointers that land inside this file -
-    pointer tables for text usually show up as long runs."""
+    """Find runs of 32-bit pointers that land inside this file - pointer
+    tables for text usually show up as long runs. With --mapping none the
+    values are taken as plain file offsets (plus --add)."""
     data = read_rom(a.file)
     mapping, add = linear_add(a, data)
-    if mapping != "none":
-        sys.exit("ptrscan supports --mapping psx / psxexe / none")
     n = len(data)
     runs, k = [], 0
     while k + 4 <= n:
@@ -698,8 +718,6 @@ def cmd_ptrscan(a) -> None:
         while j + 4 <= n:
             v = int.from_bytes(data[j:j + 4], "little")
             off = v + add
-            if a.mapping == "none" and not (0x80000000 <= v < 0x80200000):
-                break
             if not (0 <= off < n) or v == 0:
                 break
             targets.append(off)

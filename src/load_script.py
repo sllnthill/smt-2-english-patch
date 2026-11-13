@@ -35,10 +35,13 @@ SCHEMA = os.path.join(HERE, "..", "sql", "schema.sql")
 
 # control codes as romscript writes them: [F3] for unknown bytes,
 # <END>, <WAIT> etc. for codes named in a .tbl file
-CODE_RE = re.compile(r"\[[0-9A-F]{2}\]|<[^<>\n]{1,24}>")
+# Named codes must look like a name (<END>, <WAIT 2>, <br>), so ordinary
+# game text that happens to sit between angle brackets is left alone.
+CODE_RE = re.compile(r"\[[0-9A-F]{2}\]|<[A-Za-z][A-Za-z0-9_ ]{0,23}>")
 UNKNOWN_RE = re.compile(r"\[[0-9A-F]{2}\]")
 # romscript's own placeholders, not game text
-META_RE = re.compile(r"^<(SAME AS \[\d+\]|BAD POINTER)>$")
+SAME_RE = re.compile(r"^<SAME AS \[(\d+)\]>$")
+BAD_POINTER = "<BAD POINTER>"
 
 
 def char_kind(ch: str) -> str:
@@ -99,22 +102,28 @@ def parse_input(arg: str) -> Tuple[str, str]:
 
 
 def load(inputs: List[str], db_path: str) -> Dict[str, int]:
-    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
-    con = sqlite3.connect(db_path)
-    with open(SCHEMA, encoding="utf-8") as f:
-        con.executescript(f.read())
-
-    totals = {"files": 0, "lines": 0, "codes": 0, "skipped_refs": 0}
-    first_seen: Dict[str, int] = {}          # text_clean -> line_id
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-
+    # Read and check every input before touching the database, so a typo in
+    # one path can't leave an empty database behind.
+    parsed = []
     for arg in inputs:
         path, source = parse_input(arg)
         with open(path, encoding="utf-8") as f:
             records = json.load(f)
         if not isinstance(records, list):
             sys.exit(f"{path}: expected a JSON list from romscript -f json")
+        parsed.append((path, source, records))
 
+    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+    con = sqlite3.connect(db_path)
+    with open(SCHEMA, encoding="utf-8") as f:
+        con.executescript(f.read())
+
+    totals = {"files": 0, "lines": 0, "codes": 0, "reused": 0}
+    first_seen: Dict[str, int] = {}          # text_clean -> line_id
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    for path, source, records in parsed:
+        by_index = {r.get("index"): r.get("text", "") for r in records}
         cur = con.execute(
             "INSERT INTO extract_runs (source_file, dump_path, dump_sha256, line_count, loaded_at)"
             " VALUES (?, ?, ?, 0, ?)", (source, path, sha256(path), now))
@@ -122,26 +131,34 @@ def load(inputs: List[str], db_path: str) -> Dict[str, int]:
         n = 0
         for r in records:
             raw = r.get("text", "")
-            # "<SAME AS [0003]>" is romscript pointing at a line it already
-            # dumped - a reuse, not a new line of dialogue
-            if META_RE.match(raw) and raw != "<BAD POINTER>":
-                totals["skipped_refs"] += 1
-                continue
-            bad = int(raw == "<BAD POINTER>")
-            p = profile("" if bad else raw)
+            # "<SAME AS [0003]>" is romscript saying this pointer leads to
+            # text it already dumped. Keep the row (every pointer-table slot
+            # must be in the database to line up with the translation) and
+            # give it the text of the line it reuses.
+            same = SAME_RE.match(raw)
+            reuse = int(bool(same))
+            if same:
+                raw = by_index.get(int(same.group(1)), "")
+                totals["reused"] += 1
+            # a bad pointer has no text; the flag carries the meaning
+            bad = int(raw == BAD_POINTER)
+            if bad:
+                raw = ""
+            p = profile(raw)
             dup = None if p["is_empty"] else first_seen.get(p["text_clean"])
             cur = con.execute(
                 """INSERT INTO lines (run_id, source_file, string_index, file_offset,
                        pointer_at, pointer_value, text_raw, text_clean, byte_length,
                        char_count, line_breaks, control_code_count, unknown_byte_count,
                        kana_count, kanji_count, latin_count, is_empty, is_bad_pointer,
-                       duplicate_of)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       is_pointer_reuse, duplicate_of)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (run_id, source, r.get("index"), r.get("offset"), r.get("pointer_at"),
-                 r.get("pointer"), raw, p["text_clean"], r.get("length", 0),
+                 r.get("pointer"), raw, p["text_clean"],
+                 0 if reuse else r.get("length", 0),
                  p["char_count"], p["line_breaks"], p["control_code_count"],
                  p["unknown_byte_count"], p["kana_count"], p["kanji_count"],
-                 p["latin_count"], p["is_empty"], bad, dup))
+                 p["latin_count"], p["is_empty"], bad, reuse, dup))
             line_id = cur.lastrowid
             if dup is None and not p["is_empty"]:
                 first_seen[p["text_clean"]] = line_id
@@ -167,7 +184,7 @@ def main() -> None:
     t = load(a.inputs, a.db)
     print(f"loaded {t['lines']} lines and {t['codes']} control codes from "
           f"{t['files']} file(s) into {a.db}"
-          + (f" ({t['skipped_refs']} repeated pointers skipped)" if t["skipped_refs"] else ""))
+          + (f" ({t['reused']} of them reuse an earlier line's text)" if t["reused"] else ""))
 
 
 if __name__ == "__main__":

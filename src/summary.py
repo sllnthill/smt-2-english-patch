@@ -40,7 +40,13 @@ def build(db: str) -> str:
     lengths = [r[0] for r in q(con, "SELECT char_count FROM lines WHERE is_empty=0")]
     unknown_lines, unknown_bytes = q(con, "SELECT SUM(unknown_byte_count>0), "
                                           "COALESCE(SUM(unknown_byte_count),0) FROM lines")[0]
-    empty, bad = q(con, "SELECT SUM(is_empty), SUM(is_bad_pointer) FROM lines")[0]
+    # bad pointers are stored as empty rows; count them once, as bad pointers
+    empty, bad, dups, reused = q(con, """SELECT
+            SUM(is_empty = 1 AND is_bad_pointer = 0),
+            SUM(is_bad_pointer),
+            SUM(duplicate_of IS NOT NULL AND is_pointer_reuse = 0),
+            SUM(is_pointer_reuse)
+        FROM lines""")[0]
     kana, kanji, latin = q(con, "SELECT SUM(kana_count), SUM(kanji_count), "
                                 "SUM(latin_count) FROM lines")[0]
     chars = (kana or 0) + (kanji or 0) + (latin or 0)
@@ -61,7 +67,8 @@ def build(db: str) -> str:
           "## By game file\n",
           table(["File", "Lines", "Bytes", "Avg chars", "Duplicates"],
                 q(con, """SELECT source_file, COUNT(*), SUM(byte_length),
-                          ROUND(AVG(char_count),1), SUM(duplicate_of IS NOT NULL)
+                          ROUND(AVG(char_count),1),
+                          SUM(duplicate_of IS NOT NULL AND is_pointer_reuse = 0)
                           FROM lines GROUP BY source_file ORDER BY 3 DESC""")), "",
           "## Line length distribution\n",
           table(["Characters", "Lines"],
@@ -79,8 +86,9 @@ def build(db: str) -> str:
               ("Undecoded bytes", unknown_bytes, ""),
               ("Empty lines", empty or 0, pct(empty or 0, total)),
               ("Bad pointers", bad or 0, pct(bad or 0, total)),
-              ("Duplicate lines", total - unique - (empty or 0) - (bad or 0),
-               pct(total - unique - (empty or 0) - (bad or 0), total)),
+              ("Duplicate lines (same text stored twice)", dups or 0, pct(dups or 0, total)),
+              ("Reused pointers (same stored text used again)", reused or 0,
+               pct(reused or 0, total)),
           ]), "",
           "## Character makeup\n",
           table(["Type", "Characters", "Share"], [

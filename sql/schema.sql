@@ -36,8 +36,10 @@ CREATE TABLE lines (
     kana_count         INTEGER NOT NULL,
     kanji_count        INTEGER NOT NULL,
     latin_count        INTEGER NOT NULL,  -- ASCII + fullwidth letters/digits
-    is_empty           INTEGER NOT NULL,  -- 1 if nothing left after cleaning
+    is_empty           INTEGER NOT NULL,  -- 1 if nothing left after cleaning (always 1 for bad pointers)
     is_bad_pointer     INTEGER NOT NULL,  -- 1 if the pointer led outside the file
+    is_pointer_reuse   INTEGER NOT NULL,  -- 1 if this slot points at text an earlier slot already used
+                                          --   (text copied from that line, byte_length 0)
     duplicate_of       INTEGER REFERENCES lines(line_id)  -- first line with identical text
 );
 
