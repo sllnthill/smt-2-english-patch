@@ -74,11 +74,65 @@ def make_disc(path: str, exe: bytes) -> None:
             f.write(sync + bytes(3) + b"\x02" + bytes([0, 0, 8, 0]) * 2 + u + bytes(280))
 
 
-def run(*args) -> str:
+def run(*args, expect_fail: bool = False) -> str:
     r = subprocess.run([sys.executable, "-I", *args], capture_output=True, text=True)
-    if r.returncode:
+    if bool(r.returncode) != expect_fail:
         sys.exit(f"FAILED: {' '.join(args)}\n{r.stdout}{r.stderr}")
     return r.stdout + r.stderr
+
+
+def test_loader_edge_cases(tmp: str) -> None:
+    """Hand-written dump covering what the fake disc can't: a bad pointer,
+    angle-bracket game text, and a failed load leaving the database alone."""
+    dump = os.path.join(tmp, "edge.json")
+    db = os.path.join(tmp, "edge.db")
+    report = os.path.join(tmp, "edge.md")
+    records = [
+        dict(index=0, offset=16, pointer_at=0, pointer=1, length=7, text="あいう<END>"),
+        dict(index=1, offset=-5, pointer_at=4, pointer=2, length=0, text="<BAD POINTER>"),
+        dict(index=2, offset=32, pointer_at=8, pointer=3, length=7, text="あいう<END>"),
+        dict(index=3, offset=48, pointer_at=12, pointer=4, length=9, text="<1+1=2> です<END>"),
+    ]
+    with open(dump, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False)
+    run(os.path.join(SRC, "load_script.py"), dump, "--db", db)
+
+    con = sqlite3.connect(db)
+    bad = con.execute("SELECT line_id, text_raw, is_empty, control_code_count "
+                      "FROM lines WHERE is_bad_pointer=1").fetchall()
+    assert len(bad) == 1 and bad[0][1:] == ("", 1, 0), bad
+    n = con.execute("SELECT COUNT(*) FROM control_codes WHERE line_id=?",
+                    (bad[0][0],)).fetchone()[0]
+    assert n == 0, "a bad pointer must not be recorded as a control code"
+    codes = dict(con.execute("SELECT code, COUNT(*) FROM control_codes GROUP BY code"))
+    assert codes == {"<END>": 3}, codes
+    clean = con.execute("SELECT text_clean FROM lines WHERE string_index=3").fetchone()[0]
+    assert clean == "<1+1=2> です", clean      # not a control code: kept as text
+    dup = con.execute("SELECT duplicate_of, is_pointer_reuse FROM lines "
+                      "WHERE string_index=2").fetchone()
+    assert dup == (1, 0), dup                   # same text stored twice
+    con.close()
+
+    run(os.path.join(SRC, "summary.py"), "--db", db, "--out", report)
+    text = open(report, encoding="utf-8").read()
+    assert "| Empty lines | 0 |" in text, text
+    assert "| Bad pointers | 1 |" in text, text
+    assert "| Duplicate lines (same text stored twice) | 1 |" in text, text
+
+    # a missing input must fail before the existing database is rebuilt
+    run(os.path.join(SRC, "load_script.py"), dump, os.path.join(tmp, "missing.json"),
+        "--db", db, expect_fail=True)
+    con = sqlite3.connect(db)
+    assert con.execute("SELECT COUNT(*) FROM lines").fetchone()[0] == 4
+    con.close()
+
+
+def test_unsafe_disc_names() -> None:
+    sys.path.insert(0, SRC)
+    from romscript import safe_disc_path
+    assert safe_disc_path("SLPS_000.00") and safe_disc_path("DATA/FILE.BIN")
+    for name in ("..", "../x", "DATA/../../x", "/abs", "DATA//x", "C:x", "a\\..\\x"):
+        assert not safe_disc_path(name), name
 
 
 def main() -> None:
@@ -99,9 +153,12 @@ def main() -> None:
         run(os.path.join(SRC, "load_script.py"), f"{dump}=SLPS_000.00", "--db", db)
         con = sqlite3.connect(db)
         n = con.execute("SELECT COUNT(*) FROM lines").fetchone()[0]
-        assert n == 4, f"expected 4 lines (1 repeated pointer skipped), got {n}"
+        assert n == 5, f"expected one row per pointer-table slot, got {n}"
+        reuse = con.execute("SELECT string_index, duplicate_of, byte_length, text_clean "
+                            "FROM lines WHERE is_pointer_reuse=1").fetchall()
+        assert reuse == [(2, 1, 0, "こんにちは、旅の人。")], reuse
         codes = dict(con.execute("SELECT code, COUNT(*) FROM control_codes GROUP BY code"))
-        assert codes == {"<END>": 4, "[01]": 1}, codes
+        assert codes == {"<END>": 5, "[01]": 1}, codes
         clean = con.execute("SELECT text_clean FROM lines WHERE unknown_byte_count=1").fetchone()[0]
         assert clean == "ここは テスト の町です。次へ", clean
         kana, kanji = con.execute("SELECT SUM(kana_count), SUM(kanji_count) FROM lines").fetchone()
@@ -120,8 +177,13 @@ def main() -> None:
 
         run(os.path.join(SRC, "summary.py"), "--db", db, "--out", report)
         text = open(report, encoding="utf-8").read()
-        assert "| Lines | 4 |" in text, text
+        assert "| Lines | 5 |" in text, text
+        assert "| Unique lines | 4 |" in text, text
+        assert "| Reused pointers (same stored text used again) | 1 |" in text, text
         assert "旅" not in text, "report must not contain game text"
+
+        test_loader_edge_cases(tmp)
+    test_unsafe_disc_names()
     print("all pipeline tests passed")
 
 
