@@ -87,6 +87,11 @@ The game's script belongs to Atlus. This repository contains code only:
 the disc image, extracted files, JSON dumps and database are kept out of
 git (see `.gitignore`). Published reports contain statistics, not text.
 
+## License
+
+The code is MIT licensed (see [`LICENSE`](LICENSE)). The license covers
+this repository's code only, not the game or its script.
+
 ## Credits
 
 - English fan translation audited:
